@@ -79,7 +79,8 @@ function createEmptyState() {
     records: [],
     settings,
     seededCatalogs: [SEED_CATALOG_ID],
-    scoringMigrations: [SCORING_RULE_ID]
+    scoringMigrations: [SCORING_RULE_ID],
+    deletedProjectIds: []
   };
 }
 
@@ -105,12 +106,14 @@ function createSeedProjects(settings) {
   }));
 }
 
-function applySeedProjects(projects, settings) {
+function applySeedProjects(projects, settings, deletedProjectIds = []) {
   const now = new Date().toISOString();
   const result = projects.slice();
   const seeded = createSeedProjects(settings);
+  const deletedIds = new Set(deletedProjectIds.map(String));
 
   seeded.forEach((seed) => {
+    if (deletedIds.has(seed.id)) return;
     const index = result.findIndex((project) => project.id === seed.id);
     if (index >= 0) {
       const existing = result[index];
@@ -248,6 +251,7 @@ function normalizeState(input) {
   const settings = normalizeSettings(incoming.settings || {});
   const seededCatalogs = Array.isArray(incoming.seededCatalogs) ? incoming.seededCatalogs.map(String) : [];
   const scoringMigrations = Array.isArray(incoming.scoringMigrations) ? incoming.scoringMigrations.map(String) : [];
+  const deletedProjectIds = Array.isArray(incoming.deletedProjectIds) ? incoming.deletedProjectIds.map(String) : [];
   let projects = Array.isArray(incoming.projects)
     ? incoming.projects.map((project) => normalizeProject(project, settings))
     : base.projects;
@@ -260,7 +264,7 @@ function normalizeState(input) {
     scoringMigrations.push(SCORING_RULE_ID);
   }
 
-  projects = applySeedProjects(projects, settings);
+  projects = applySeedProjects(projects, settings, deletedProjectIds);
   if (!seededCatalogs.includes(SEED_CATALOG_ID)) seededCatalogs.push(SEED_CATALOG_ID);
 
   return {
@@ -271,7 +275,8 @@ function normalizeState(input) {
       : base.records,
     settings,
     seededCatalogs,
-    scoringMigrations
+    scoringMigrations,
+    deletedProjectIds
   };
 }
 
@@ -329,17 +334,21 @@ function normalizeMultiplierRules(rules) {
 
 function normalizeProject(project, settings) {
   const now = new Date().toISOString();
-  const normalizedProject = {
-    level1: cleanText(project.level1 || ""),
-    level2: cleanText(project.level2 || ""),
-    level3: cleanText(project.level3 || "")
-  };
+  const normalizedProject = normalizeHierarchyParts({
+    system: project.system,
+    level1: project.level1,
+    level2: project.level2,
+    level3: project.level3
+  });
   const canScore = hasScoringLevels(normalizedProject);
+  const projectName = cleanText(
+    project.name || project.projectName || normalizedProject.level3 || normalizedProject.level2 || normalizedProject.level1 || "未命名项目"
+  );
 
   return {
     id: String(project.id || makeId()),
-    name: cleanText(project.name || project.projectName || "未命名项目"),
-    system: cleanText(project.system || "其他"),
+    name: projectName,
+    system: normalizedProject.system,
     level1: normalizedProject.level1,
     level2: normalizedProject.level2,
     level3: normalizedProject.level3,
@@ -353,6 +362,16 @@ function normalizeProject(project, settings) {
     rewards: normalizeRewards(project.rewards),
     createdAt: project.createdAt || now,
     updatedAt: project.updatedAt || now
+  };
+}
+
+function normalizeHierarchyParts(project) {
+  const level1 = cleanText(project.level1 || project.system || "") || "其他";
+  return {
+    system: level1,
+    level1,
+    level2: cleanText(project.level2 || ""),
+    level3: cleanText(project.level3 || "")
   };
 }
 
@@ -456,13 +475,13 @@ function renderDashboard() {
           <span class="metric-chip">基础战斗力 <strong>${formatNumber(stats.basePower)}</strong></span>
           <span class="metric-chip">综合倍率 <strong>×${trimNumber(stats.multiplier)}</strong></span>
           <span class="metric-chip">等级总和 <strong>${formatNumber(stats.levelSum)}</strong></span>
-          <span class="metric-chip">系统 <strong>${stats.systems.length}</strong></span>
+          <span class="metric-chip">一级 <strong>${stats.systems.length}</strong></span>
         </div>
       </div>
     </section>
 
     <div class="section-head">
-      <h2>系统成长树</h2>
+      <h2>一级成长树</h2>
       <p>点分类展开</p>
     </div>
     <section class="tree-panel dashboard-tree">
@@ -481,7 +500,7 @@ function renderSystemBand(system) {
         </div>
         <div class="system-score">${formatNumber(system.score)}</div>
       </div>
-      <div class="bar" aria-label="系统等级进度">
+      <div class="bar" aria-label="一级等级进度">
         <span style="--value:${system.levelInfo.progressPercent}%"></span>
       </div>
       <div class="inline-row muted">
@@ -575,7 +594,7 @@ function renderProjects() {
   const stats = getAllStats();
   const sorted = stats.projectStats.sort((a, b) => {
     if (a.project.enabled !== b.project.enabled) return a.project.enabled ? -1 : 1;
-    return a.project.system.localeCompare(b.project.system, "zh-CN") || a.project.name.localeCompare(b.project.name, "zh-CN");
+    return getLevelOneName(a.project).localeCompare(getLevelOneName(b.project), "zh-CN") || a.project.name.localeCompare(b.project.name, "zh-CN");
   });
 
   return `
@@ -583,7 +602,7 @@ function renderProjects() {
       <div class="card-header">
         <div>
           <h2 class="project-title">项目配置</h2>
-          <p class="project-path">按系统树维护，每个节点一行</p>
+          <p class="project-path">按一级项目树维护，每个节点一行</p>
         </div>
         <button class="primary-btn" type="button" data-action="add-project">新增</button>
       </div>
@@ -608,13 +627,13 @@ function buildProjectTree(projectStats) {
 
   projectStats.forEach((item) => {
     const project = item.project;
-    const systemName = project.system || "其他";
+    const systemName = getLevelOneName(project);
     if (!systems.has(systemName)) {
       systems.set(
         systemName,
-        createTreeNode(`${systemName}系统`, "folder", `system:${systemName}`, {
+        createTreeNode(systemName, "folder", `level1:${systemName}`, {
           system: systemName,
-          level1: "",
+          level1: systemName,
           level2: "",
           level3: ""
         })
@@ -636,7 +655,7 @@ function buildProjectTree(projectStats) {
     });
   });
 
-  return Array.from(systems.values()).sort((a, b) => compareSystemNames(a.label.replace(/系统$/, ""), b.label.replace(/系统$/, "")));
+  return Array.from(systems.values()).sort((a, b) => compareSystemNames(a.label, b.label));
 }
 
 function createTreeNode(label, type, key, context) {
@@ -674,19 +693,19 @@ function addTreeStats(node, item) {
 }
 
 function getProjectTreeEntries(project) {
+  const level1 = getLevelOneName(project);
   const context = {
-    system: project.system || "其他",
-    level1: "",
+    system: level1,
+    level1,
     level2: "",
     level3: ""
   };
   const entries = [];
 
-  [project.level1, project.level2, project.level3].forEach((levelName, index) => {
+  [project.level2, project.level3].forEach((levelName, index) => {
     const clean = cleanText(levelName);
     if (!clean) return;
-    context[`level${index + 1}`] = clean;
-    if (index === 0 && clean === project.system) return;
+    context[`level${index + 2}`] = clean;
     if (entries.length && entries[entries.length - 1].label === clean) return;
     entries.push({
       label: clean,
@@ -853,7 +872,7 @@ function renderGrowth() {
   const systems = stats.systems.filter((system) => system.projects.length);
 
   if (!systems.length) {
-    return emptyState("还没有成长数据", "新增项目并完成打星后，这里会按系统展示等级。");
+    return emptyState("还没有成长数据", "新增项目并完成打星后，这里会按一级项目展示等级。");
   }
 
   return systems
@@ -1046,6 +1065,7 @@ function handleModalClick(event) {
   if (action === "history-rating") updateHistoryRating(recordId, Number(rating));
   if (action === "delete-record") deleteRecord(recordId);
   if (action === "edit-project") openProjectForm(projectId);
+  if (action === "delete-project") deleteProject(projectId);
 }
 
 function handleModalSubmit(event) {
@@ -1158,7 +1178,10 @@ function openProjectForm(projectId, preset = null) {
             </div>
           </details>
 
-          <button class="primary-btn" type="submit">保存项目</button>
+          <div class="actions form-actions">
+            <button class="primary-btn" type="submit">保存项目</button>
+            ${existing ? `<button class="danger-btn" type="button" data-action="delete-project" data-project-id="${escapeAttr(existing.id)}">删除项目</button>` : ""}
+          </div>
         </form>
       </section>
     </div>
@@ -1166,16 +1189,17 @@ function openProjectForm(projectId, preset = null) {
 }
 
 function renderLockedHierarchyFields(project) {
+  const level1 = getLevelOneName(project);
   return `
-    <input type="hidden" name="system" value="${escapeAttr(project.system)}">
-    <input type="hidden" name="level1" value="${escapeAttr(project.level1)}">
+    <input type="hidden" name="system" value="${escapeAttr(level1)}">
+    <input type="hidden" name="level1" value="${escapeAttr(level1)}">
     <input type="hidden" name="level2" value="${escapeAttr(project.level2)}">
     <input type="hidden" name="level3" value="${escapeAttr(project.level3)}">
   `;
 }
 
 function getNextChildLevel(context) {
-  if (!context || !cleanText(context.system)) return null;
+  if (!context) return null;
   if (!cleanText(context.level1)) return 1;
   if (!cleanText(context.level2)) return 2;
   if (!cleanText(context.level3)) return 3;
@@ -1205,14 +1229,32 @@ function getChildScoringHint(project, childLevel) {
   return "三级项目下面不能再添加下级";
 }
 
+function normalizeManualHierarchy(formData) {
+  const rawName = cleanText(formData.get("name"));
+  let level1 = cleanText(formData.get("level1"));
+  let level2 = cleanText(formData.get("level2"));
+  let level3 = cleanText(formData.get("level3"));
+
+  if (!level1) level1 = rawName || level3 || level2 || "其他";
+  if (!level3 && level2 && rawName && rawName !== level2) level3 = rawName;
+  if (level3 && rawName) level3 = rawName;
+
+  const name = rawName || level3 || level2 || level1 || "未命名项目";
+  return {
+    name,
+    system: level1,
+    level1,
+    level2,
+    level3
+  };
+}
+
 function renderEditableHierarchyFields(project) {
+  const level1 = getLevelOneName(project);
   return `
-    <label>所属系统
-      <input name="system" required maxlength="40" value="${escapeAttr(project.system)}" placeholder="身体">
-    </label>
     <div class="two-col">
       <label>一级项目
-        <input name="level1" maxlength="40" value="${escapeAttr(project.level1)}" placeholder="运动">
+        <input name="level1" required maxlength="40" value="${escapeAttr(level1 === "其他" && !project.level1 && !project.system ? "" : level1)}" placeholder="身体">
       </label>
       <label>二级项目
         <input name="level2" maxlength="40" value="${escapeAttr(project.level2)}" placeholder="有氧">
@@ -1226,8 +1268,7 @@ function renderEditableHierarchyFields(project) {
 
 function formatPresetPath(project) {
   const parts = [
-    ["系统", project.system],
-    ["一级", project.level1],
+    ["一级", getLevelOneName(project)],
     ["二级", project.level2],
     ["三级", project.level3]
   ];
@@ -1241,12 +1282,11 @@ function formatPresetPath(project) {
 
 function deriveChildHierarchy(formData) {
   const name = cleanText(formData.get("name")) || "未命名项目";
-  const hierarchy = {
-    system: cleanText(formData.get("system")) || "其他",
+  const hierarchy = normalizeHierarchyParts({
     level1: cleanText(formData.get("level1")),
     level2: cleanText(formData.get("level2")),
     level3: cleanText(formData.get("level3"))
-  };
+  });
   const childLevel = getNextChildLevel(hierarchy);
 
   if (childLevel === 1) {
@@ -1258,7 +1298,9 @@ function deriveChildHierarchy(formData) {
   }
 
   return {
+    ...normalizeHierarchyParts(hierarchy),
     ...hierarchy,
+    system: hierarchy.level1,
     name
   };
 }
@@ -1295,7 +1337,8 @@ function openProjectDetail(projectId) {
           </div>
           ${stats.levelInfo.next && stats.nextReward ? `<p class="task-text">奖励：${escapeHtml(stats.nextReward)}</p>` : ""}
           <div class="actions">
-            <button class="tiny-btn" type="button" data-action="edit-project" data-project-id="${escapeAttr(project.id)}">编辑项目</button>
+            <button class="tiny-btn" type="button" data-action="edit-project" data-project-id="${escapeAttr(project.id)}">修改名字</button>
+            <button class="danger-btn tiny-btn" type="button" data-action="delete-project" data-project-id="${escapeAttr(project.id)}">删除项目</button>
           </div>
         </div>
 
@@ -1356,18 +1399,12 @@ function saveProjectFromForm(form) {
 
   const hierarchy = form.dataset.presetChild === "1"
     ? deriveChildHierarchy(formData)
-    : {
-        name: cleanText(formData.get("name")) || "未命名项目",
-        system: cleanText(formData.get("system")) || "其他",
-        level1: cleanText(formData.get("level1")),
-        level2: cleanText(formData.get("level2")),
-        level3: cleanText(formData.get("level3"))
-      };
+    : normalizeManualHierarchy(formData);
 
   const project = {
     id: projectId,
     name: hierarchy.name,
-    system: hierarchy.system,
+    system: hierarchy.level1,
     level1: hierarchy.level1,
     level2: hierarchy.level2,
     level3: hierarchy.level3,
@@ -1454,6 +1491,26 @@ function toggleProjectToday(projectId) {
   saveState();
   render();
   showToast(project.showToday ? "今日已显示" : "今日已隐藏");
+}
+
+function deleteProject(projectId) {
+  const project = state.projects.find((item) => item.id === projectId);
+  if (!project) return;
+  const confirmed =
+    typeof window === "undefined" ||
+    window.confirm(`确定删除「${project.name}」吗？这个项目的历史记录也会一起删除。`);
+  if (!confirmed) return;
+
+  state.projects = state.projects.filter((item) => item.id !== projectId);
+  state.records = state.records.filter((record) => record.projectId !== projectId);
+  if (!Array.isArray(state.deletedProjectIds)) state.deletedProjectIds = [];
+  if (!state.deletedProjectIds.includes(projectId)) state.deletedProjectIds.push(projectId);
+  if (activeDetailProjectId === projectId) activeDetailProjectId = null;
+
+  saveState();
+  closeModal();
+  render();
+  showToast("项目已删除");
 }
 
 function setCurrentRating(projectId, rating) {
@@ -1574,7 +1631,7 @@ function getAllStats() {
   const systemsMap = new Map();
 
   projectStats.forEach((item) => {
-    const systemName = item.project.system || "其他";
+    const systemName = getLevelOneName(item.project);
     if (!systemsMap.has(systemName)) {
       systemsMap.set(systemName, {
         name: systemName,
@@ -1585,7 +1642,7 @@ function getAllStats() {
   });
 
   scoringProjectStats.forEach((item) => {
-    const systemName = item.project.system || "其他";
+    const systemName = getLevelOneName(item.project);
     const system = systemsMap.get(systemName);
     system.score += item.score;
     system.projects.push(item);
@@ -1732,7 +1789,7 @@ function currentPeriodForProject(project) {
 
 function groupProjectsBySystem(projects) {
   return projects.reduce((groups, project) => {
-    const key = project.system || "其他";
+    const key = getLevelOneName(project);
     if (!groups[key]) groups[key] = [];
     groups[key].push(project);
     return groups;
@@ -1740,15 +1797,14 @@ function groupProjectsBySystem(projects) {
 }
 
 function getProjectPath(project) {
-  const parts = [project.system, project.level1, project.level2, project.level3].filter(Boolean);
+  const parts = [getLevelOneName(project), project.level2, project.level3].filter(Boolean);
   const compact = parts.filter((part, index) => index === 0 || part !== parts[index - 1]);
   return compact.join(" / ") || "其他";
 }
 
 function renderHierarchyChips(project) {
   const chips = [
-    ["系统", project.system],
-    ["一级", project.level1],
+    ["一级", getLevelOneName(project)],
     ["二级", project.level2],
     ["三级", project.level3]
   ];
@@ -1760,9 +1816,13 @@ function renderHierarchyChips(project) {
 }
 
 function getProjectIdentityKey(project) {
-  return [project.system, project.level1, project.level2, project.level3, project.name]
+  return [getLevelOneName(project), project.level2, project.level3, project.name]
     .map((part) => cleanText(part).toLowerCase())
     .join("|");
+}
+
+function getLevelOneName(project) {
+  return cleanText(project?.level1 || project?.system || "") || "其他";
 }
 
 function compareSystemNames(a, b) {
@@ -1902,8 +1962,10 @@ globalThis.CombatPowerTest = {
   buildProjectTree,
   renderProjectTree,
   deriveChildHierarchy,
+  normalizeManualHierarchy,
   canAddChild,
   getNextChildLevel,
+  getLevelOneName,
   getAllStats,
   getCombatMultiplier,
   isScoringProject,
