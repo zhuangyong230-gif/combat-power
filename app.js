@@ -1057,6 +1057,8 @@ function handleModalSubmit(event) {
 function openProjectForm(projectId, preset = null) {
   const existing = state.projects.find((project) => project.id === projectId);
   const lockedPreset = !existing && preset && preset.system;
+  const childLevel = lockedPreset ? getNextChildLevel(preset) : null;
+  const childLevelLabel = childLevel ? getLevelLabel(childLevel) : "项目";
   const project =
     existing ||
     {
@@ -1076,8 +1078,12 @@ function openProjectForm(projectId, preset = null) {
       rewards: {}
     };
 
-  const title = existing ? "编辑项目" : "新增项目";
+  const title = existing ? "编辑项目" : lockedPreset ? `新增${childLevelLabel}` : "新增项目";
   const hierarchyFields = lockedPreset ? renderLockedHierarchyFields(project) : renderEditableHierarchyFields(project);
+  const scoringHint = lockedPreset
+    ? getChildScoringHint(project, childLevel)
+    : "必须有一级、二级、三级；未满三级只作为分类，不进今日，不计战斗力";
+  const qualityHint = getQualityHint(existing || project);
   refs.modalRoot.innerHTML = `
     <div class="modal-backdrop">
       <section class="modal-panel" role="dialog" aria-modal="true" aria-label="${title}">
@@ -1089,10 +1095,10 @@ function openProjectForm(projectId, preset = null) {
           ${lockedPreset ? `<div class="path-lock"><span>添加到</span><strong>${escapeHtml(formatPresetPath(project))}</strong></div>` : ""}
           <div class="path-lock">
             <span>计分规则</span>
-            <strong>必须有一级、二级、三级；未满三级只作为分类，不进今日，不计战斗力</strong>
+            <strong>${escapeHtml(scoringHint)}</strong>
           </div>
-          <label>项目名称
-            <input name="name" required maxlength="40" value="${escapeAttr(project.name)}" placeholder="${lockedPreset ? "下级名称" : "跑步"}">
+          <label>${escapeHtml(lockedPreset ? childLevelLabel : "项目名称")}
+            <input name="name" required maxlength="40" value="${escapeAttr(project.name)}" placeholder="${escapeAttr(lockedPreset ? getChildPlaceholder(childLevel) : "跑步")}">
           </label>
           ${hierarchyFields}
           <label>具体任务内容
@@ -1111,7 +1117,7 @@ function openProjectForm(projectId, preset = null) {
           </div>
           <div class="path-lock">
             <span>质量系数</span>
-            <strong>Lv1 ×1.0，Lv2 ×1.1，之后每级 +0.1</strong>
+            <strong>${escapeHtml(qualityHint)}</strong>
           </div>
           <label class="switch-row">是否启用
             <input name="enabled" type="checkbox" ${project.enabled ? "checked" : ""}>
@@ -1168,6 +1174,37 @@ function renderLockedHierarchyFields(project) {
   `;
 }
 
+function getNextChildLevel(context) {
+  if (!context || !cleanText(context.system)) return null;
+  if (!cleanText(context.level1)) return 1;
+  if (!cleanText(context.level2)) return 2;
+  if (!cleanText(context.level3)) return 3;
+  return null;
+}
+
+function getLevelLabel(level) {
+  return {
+    1: "一级项目",
+    2: "二级项目",
+    3: "三级项目"
+  }[level] || "项目";
+}
+
+function getChildPlaceholder(level) {
+  return {
+    1: "例如：表达",
+    2: "例如：口才",
+    3: "例如：10分钟表达训练"
+  }[level] || "例如：跑步";
+}
+
+function getChildScoringHint(project, childLevel) {
+  if (childLevel === 3) return "保存后就是三级项目，可进入今日，并计算战斗力";
+  if (childLevel === 2) return "保存后是二级分类；继续添加三级项目后才计战斗力";
+  if (childLevel === 1) return "保存后是一级分类；补齐二级、三级后才计战斗力";
+  return "三级项目下面不能再添加下级";
+}
+
 function renderEditableHierarchyFields(project) {
   return `
     <label>所属系统
@@ -1188,9 +1225,17 @@ function renderEditableHierarchyFields(project) {
 }
 
 function formatPresetPath(project) {
-  return [project.system && `${project.system}系统`, project.level1, project.level2, project.level3]
-    .filter(Boolean)
-    .filter((part, index, list) => index === 0 || part !== list[index - 1])
+  const parts = [
+    ["系统", project.system],
+    ["一级", project.level1],
+    ["二级", project.level2],
+    ["三级", project.level3]
+  ];
+
+  return parts
+    .filter(([, value]) => cleanText(value))
+    .filter(([, value], index, list) => index === 0 || value !== list[index - 1][1])
+    .map(([label, value]) => `${label}：${value}`)
     .join(" / ");
 }
 
@@ -1202,12 +1247,13 @@ function deriveChildHierarchy(formData) {
     level2: cleanText(formData.get("level2")),
     level3: cleanText(formData.get("level3"))
   };
+  const childLevel = getNextChildLevel(hierarchy);
 
-  if (!hierarchy.level1) {
+  if (childLevel === 1) {
     hierarchy.level1 = name;
-  } else if (!hierarchy.level2) {
+  } else if (childLevel === 2) {
     hierarchy.level2 = name;
-  } else if (!hierarchy.level3) {
+  } else if (childLevel === 3) {
     hierarchy.level3 = name;
   }
 
@@ -1584,23 +1630,12 @@ function calculateProjectStats(project, records = state.records, settings = stat
 
   const projectRecords = records.filter((record) => record.projectId === project.id).sort(compareRecordsAsc);
   const completedCount = projectRecords.length;
-  let runningScore = 0;
-  let starScoreSum = 0;
-  let qualityPower = 0;
-
-  projectRecords.forEach((record) => {
-    const completionPower = project.completionCoefficient;
-    const currentLevel = getLevelInfo(runningScore, project.levelRules || settings.levelRules).current.level;
-    const qualityMultiplier = getQualityMultiplierForLevel(currentLevel);
-    const starPower = getStarScore(record.rating, settings);
-    const recordQualityPower = starPower * qualityMultiplier;
-
-    starScoreSum += starPower;
-    qualityPower += recordQualityPower;
-    runningScore += completionPower + recordQualityPower;
-  });
-
-  const score = runningScore;
+  const completionPower = completedCount * project.completionCoefficient;
+  const starScoreSum = projectRecords.reduce((sum, record) => sum + getStarScore(record.rating, settings), 0);
+  const resolvedLevel = getScoreLinkedLevel(completionPower, starScoreSum, project.levelRules || settings.levelRules);
+  const qualityMultiplier = getQualityMultiplierForLevel(resolvedLevel);
+  const qualityPower = starScoreSum * qualityMultiplier;
+  const score = completionPower + qualityPower;
   const levelInfo = getLevelInfo(score, project.levelRules || settings.levelRules);
   const nextReward = levelInfo.next ? project.rewards[String(levelInfo.next.level)] || "" : "";
 
@@ -1610,14 +1645,36 @@ function calculateProjectStats(project, records = state.records, settings = stat
     completedCount,
     starScoreSum,
     qualityPower,
+    qualityMultiplier,
     score,
     levelInfo,
     nextReward
   };
 }
 
+function getScoreLinkedLevel(completionPower, starScoreSum, rules) {
+  const sorted = normalizeLevelRules(rules, DEFAULT_LEVEL_RULES).sort((a, b) => a.score - b.score || a.level - b.level);
+  let current = sorted[0]?.level || 1;
+
+  sorted.forEach((rule) => {
+    const scoreAtLevel = completionPower + starScoreSum * getQualityMultiplierForLevel(rule.level);
+    if (scoreAtLevel >= rule.score) current = rule.level;
+  });
+
+  return current;
+}
+
 function getQualityMultiplierForLevel(level) {
   return 1 + Math.max(0, numberOr(level, 1) - 1) * 0.1;
+}
+
+function getQualityHint(project) {
+  if (!project || !isScoringProject(project)) {
+    return "未满三级不计算；三级项目从 Lv1 ×1.0 开始，升级后自动切换";
+  }
+
+  const stats = calculateProjectStats(project);
+  return `当前 Lv${stats.levelInfo.current.level} ×${trimNumber(stats.qualityMultiplier)}；等级变化后自动重算`;
 }
 
 function getCombatMultiplier(levelSum) {
@@ -1846,10 +1903,12 @@ globalThis.CombatPowerTest = {
   renderProjectTree,
   deriveChildHierarchy,
   canAddChild,
+  getNextChildLevel,
   getAllStats,
   getCombatMultiplier,
   isScoringProject,
   calculateProjectStats,
+  getScoreLinkedLevel,
   getQualityMultiplierForLevel,
   getLevelInfo,
   getISOWeekKey,

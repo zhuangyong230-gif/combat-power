@@ -1,10 +1,10 @@
-const CACHE_NAME = "combat-power-v10";
+const CACHE_NAME = "combat-power-v11";
 const ASSETS = [
   "./",
   "./index.html",
-  "./style.css?v=10",
-  "./app.js?v=10",
-  "./manifest.webmanifest?v=10",
+  "./style.css?v=11",
+  "./app.js?v=11",
+  "./manifest.webmanifest?v=11",
   "./icon.svg"
 ];
 
