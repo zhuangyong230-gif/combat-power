@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#080b12">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="战斗力">
+    <meta name="description" content="个人战斗力成长系统，本地保存，快速打星。">
+    <title>个人战斗力成长系统</title>
+    <link rel="manifest" href="manifest.webmanifest?v=10">
+    <link rel="apple-touch-icon" href="icon.svg">
+    <link rel="icon" href="icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="style.css?v=10">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Combat Power</p>
+          <h1 id="routeTitle">战斗力</h1>
+        </div>
+        <div class="date-pill" id="todayLabel"></div>
+      </header>
+
+      <main id="view" class="view" aria-live="polite"></main>
+
+      <nav class="bottom-nav" aria-label="底部导航">
+        <button class="nav-button is-active" type="button" data-route="dashboard">
+          <span class="nav-icon">⚔</span>
+          <span>战斗力</span>
+        </button>
+        <button class="nav-button" type="button" data-route="today">
+          <span class="nav-icon">★</span>
+          <span>今日</span>
+        </button>
+        <button class="nav-button" type="button" data-route="projects">
+          <span class="nav-icon">◇</span>
+          <span>项目</span>
+        </button>
+        <button class="nav-button" type="button" data-route="growth">
+          <span class="nav-icon">▣</span>
+          <span>成长</span>
+        </button>
+        <button class="nav-button" type="button" data-route="settings">
+          <span class="nav-icon">⚙</span>
+          <span>设置</span>
+        </button>
+      </nav>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="modalRoot"></div>
+    <input id="importFile" class="sr-only" type="file" accept="application/json,.json">
+
+    <script src="app.js?v=10" defer></script>
+  </body>
+</html>
