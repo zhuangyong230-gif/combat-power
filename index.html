@@ -7,12 +7,12 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="战斗力">
-    <meta name="description" content="个人战斗力成长系统，本地保存，快速打星。">
+    <meta name="description" content="个人战斗力成长系统，快速打星，支持本地缓存和账号同步。">
     <title>个人战斗力成长系统</title>
-    <link rel="manifest" href="manifest.webmanifest?v=12">
+    <link rel="manifest" href="manifest.webmanifest?v=13">
     <link rel="apple-touch-icon" href="icon.svg">
     <link rel="icon" href="icon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="style.css?v=12">
+    <link rel="stylesheet" href="style.css?v=13">
   </head>
   <body>
     <div class="app-shell">
@@ -54,6 +54,8 @@
     <div id="modalRoot"></div>
     <input id="importFile" class="sr-only" type="file" accept="application/json,.json">
 
-    <script src="app.js?v=12" defer></script>
+    <script src="sync-config.js?v=13" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2" defer></script>
+    <script src="app.js?v=13" defer></script>
   </body>
 </html>

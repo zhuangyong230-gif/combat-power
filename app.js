@@ -1,5 +1,7 @@
 const STORAGE_KEY = "combat-power-system:v1";
 const UI_STORAGE_KEY = "combat-power-ui:v1";
+const CLOUD_TABLE_NAME = "combat_profiles";
+const CLOUD_SAVE_DELAY = 900;
 
 const ROUTES = {
   dashboard: "战斗力",
@@ -59,6 +61,18 @@ let currentRoute = "dashboard";
 let refs = {};
 let activeDetailProjectId = null;
 let uiState = createDefaultUiState();
+let cloudSaveTimer = null;
+let isApplyingRemoteState = false;
+
+const cloudState = {
+  configured: false,
+  client: null,
+  user: null,
+  tableName: CLOUD_TABLE_NAME,
+  status: "local",
+  message: "本机保存",
+  lastSyncedAt: ""
+};
 
 function createDefaultUiState() {
   return {
@@ -67,6 +81,7 @@ function createDefaultUiState() {
 }
 
 function createEmptyState() {
+  const now = new Date().toISOString();
   const settings = {
     starScores: DEFAULT_STAR_SCORES.slice(),
     levelRules: cloneRules(DEFAULT_LEVEL_RULES),
@@ -75,6 +90,7 @@ function createEmptyState() {
 
   return {
     version: 1,
+    updatedAt: now,
     projects: createSeedProjects(settings),
     records: [],
     settings,
@@ -165,11 +181,11 @@ function cloneMultipliers(rules) {
   }));
 }
 
-function init() {
+async function init() {
   state = loadState();
   uiState = loadUiState();
   currentRoute = getRouteFromHash();
-  saveState();
+  saveState({ localOnly: true, skipTouch: true });
   refs = {
     view: document.getElementById("view"),
     routeTitle: document.getElementById("routeTitle"),
@@ -205,6 +221,7 @@ function init() {
   refs.importFile.addEventListener("change", handleImportFile);
 
   registerServiceWorker();
+  await initCloudSync();
   render();
 }
 
@@ -267,17 +284,30 @@ function normalizeState(input) {
   projects = applySeedProjects(projects, settings, deletedProjectIds);
   if (!seededCatalogs.includes(SEED_CATALOG_ID)) seededCatalogs.push(SEED_CATALOG_ID);
 
+  const records = Array.isArray(incoming.records)
+    ? dedupeRecords(incoming.records.map(normalizeRecord).filter(Boolean))
+    : base.records;
+
   return {
     version: 1,
+    updatedAt: resolveStateUpdatedAt(incoming, projects, records),
     projects,
-    records: Array.isArray(incoming.records)
-      ? dedupeRecords(incoming.records.map(normalizeRecord).filter(Boolean))
-      : base.records,
+    records,
     settings,
     seededCatalogs,
     scoringMigrations,
     deletedProjectIds
   };
+}
+
+function resolveStateUpdatedAt(incoming, projects, records) {
+  const timestamps = [incoming.updatedAt]
+    .concat(projects.map((project) => project.updatedAt))
+    .concat(records.map((record) => record.updatedAt))
+    .map((value) => Date.parse(value))
+    .filter(Number.isFinite);
+
+  return timestamps.length ? new Date(Math.max(...timestamps)).toISOString() : new Date().toISOString();
 }
 
 function applyScoringMigrationToProject(project) {
@@ -423,13 +453,355 @@ function dedupeRecords(records) {
   return Array.from(byPeriod.values());
 }
 
-function saveState() {
+function saveState(options = {}) {
   if (typeof localStorage === "undefined") return;
+  if (!options.skipTouch) state.updatedAt = new Date().toISOString();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  if (!options.localOnly) queueCloudSave();
+}
+
+async function initCloudSync() {
+  const config = getCloudConfig();
+  cloudState.tableName = config.tableName || CLOUD_TABLE_NAME;
+
+  if (!config.supabaseUrl || !config.supabaseAnonKey) {
+    cloudState.configured = false;
+    cloudState.status = "local";
+    cloudState.message = "本机保存";
+    return;
+  }
+
+  cloudState.configured = true;
+  if (!globalThis.supabase || typeof globalThis.supabase.createClient !== "function") {
+    cloudState.status = "error";
+    cloudState.message = "同步组件未加载";
+    return;
+  }
+
+  try {
+    cloudState.client = globalThis.supabase.createClient(config.supabaseUrl, config.supabaseAnonKey, {
+      auth: {
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+        persistSession: true,
+        storageKey: "combat-power-auth"
+      }
+    });
+
+    const { data, error } = await cloudState.client.auth.getSession();
+    if (error) throw error;
+
+    cloudState.user = data.session?.user || null;
+    cloudState.status = cloudState.user ? "syncing" : "signed-out";
+    cloudState.message = cloudState.user ? "正在同步" : "请登录";
+
+    cloudState.client.auth.onAuthStateChange((event, session) => {
+      const previousUserId = cloudState.user?.id || "";
+      cloudState.user = session?.user || null;
+
+      if (event === "SIGNED_IN" && cloudState.user && cloudState.user.id !== previousUserId) {
+        syncFromCloud("auth", { render: true, toast: false }).catch((error) => handleCloudError(error, "同步失败"));
+      }
+
+      if (event === "SIGNED_OUT") {
+        cloudState.status = "signed-out";
+        cloudState.message = "请登录";
+        render();
+      }
+    });
+
+    if (cloudState.user) {
+      await syncFromCloud("init", { render: false, toast: false });
+    }
+  } catch (error) {
+    handleCloudError(error, "登录状态读取失败");
+  }
+}
+
+function getCloudConfig() {
+  const config = globalThis.COMBAT_CLOUD_CONFIG && typeof globalThis.COMBAT_CLOUD_CONFIG === "object"
+    ? globalThis.COMBAT_CLOUD_CONFIG
+    : {};
+  const supabaseUrl = cleanCloudConfigValue(config.supabaseUrl || config.url || "");
+  const supabaseAnonKey = cleanCloudConfigValue(
+    config.supabaseAnonKey || config.anonKey || config.publishableKey || config.key || ""
+  );
+  const tableName = cleanText(config.tableName || CLOUD_TABLE_NAME) || CLOUD_TABLE_NAME;
+
+  return {
+    supabaseUrl,
+    supabaseAnonKey,
+    tableName
+  };
+}
+
+function cleanCloudConfigValue(value) {
+  const text = cleanText(value);
+  if (!text || /YOUR_|填入|PASTE_/i.test(text)) return "";
+  return text;
+}
+
+function shouldShowLogin() {
+  return cloudState.configured && !cloudState.user;
+}
+
+function queueCloudSave() {
+  if (!cloudState.configured || !cloudState.client || !cloudState.user || isApplyingRemoteState) return;
+  cloudState.status = "pending";
+  cloudState.message = "等待同步";
+  window.clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = window.setTimeout(() => {
+    uploadCloudState().catch((error) => handleCloudError(error, "自动同步失败"));
+  }, CLOUD_SAVE_DELAY);
+}
+
+async function syncFromCloud(source = "manual", options = {}) {
+  if (!cloudState.client || !cloudState.user) return false;
+
+  window.clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = null;
+  cloudState.status = "syncing";
+  cloudState.message = "正在同步";
+  let synced = false;
+
+  try {
+    const { data, error } = await cloudState.client
+      .from(cloudState.tableName)
+      .select("data, updated_at")
+      .eq("user_id", cloudState.user.id)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (data && data.data) {
+      const remoteState = normalizeState(data.data);
+      const remoteTimestamp = Math.max(getStateTimestamp(remoteState), Date.parse(data.updated_at) || 0);
+      const localTimestamp = getStateTimestamp(state);
+      const localShouldWin = hasMeaningfulUserData(state) && localTimestamp > remoteTimestamp + 1000;
+
+      if (localShouldWin) {
+        await uploadCloudState({ skipStatus: true });
+        cloudState.message = source === "manual" ? "已上传本机数据" : "已同步本机数据";
+      } else {
+        isApplyingRemoteState = true;
+        state = remoteState;
+        saveState({ localOnly: true, skipTouch: true });
+        isApplyingRemoteState = false;
+        cloudState.message = "已同步云端数据";
+      }
+    } else {
+      await uploadCloudState({ skipStatus: true });
+      cloudState.message = "已创建云端数据";
+    }
+
+    cloudState.status = "synced";
+    cloudState.lastSyncedAt = new Date().toISOString();
+    synced = true;
+    if (options.toast !== false) showToast("同步完成");
+  } catch (error) {
+    isApplyingRemoteState = false;
+    handleCloudError(error, "同步失败");
+  } finally {
+    if (options.render !== false) render();
+  }
+
+  return synced;
+}
+
+async function uploadCloudState(options = {}) {
+  if (!cloudState.client || !cloudState.user || isApplyingRemoteState) return;
+
+  window.clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = null;
+  const now = new Date().toISOString();
+  if (!state.updatedAt) state.updatedAt = now;
+
+  if (!options.skipStatus) {
+    cloudState.status = "syncing";
+    cloudState.message = "正在上传";
+  }
+
+  const payload = JSON.parse(JSON.stringify(state));
+  const { error } = await cloudState.client.from(cloudState.tableName).upsert(
+    {
+      user_id: cloudState.user.id,
+      data: payload,
+      updated_at: now
+    },
+    { onConflict: "user_id" }
+  );
+
+  if (error) throw error;
+
+  cloudState.status = "synced";
+  cloudState.message = "已同步";
+  cloudState.lastSyncedAt = now;
+}
+
+function handleCloudError(error, fallbackMessage) {
+  console.error(error);
+  cloudState.status = "error";
+  cloudState.message = error && error.message ? `${fallbackMessage}：${error.message}` : fallbackMessage;
+  if (refs.view) showToast(fallbackMessage);
+}
+
+async function handleLoginSubmit(event) {
+  const form = event.target;
+  const mode = event.submitter?.dataset.authMode || "signin";
+  const account = cleanText(new FormData(form).get("account"));
+  const password = String(new FormData(form).get("password") || "");
+  const submitter = event.submitter;
+
+  if (!cloudState.client) {
+    showToast("云同步未配置");
+    return;
+  }
+
+  if (!account || !password) {
+    showToast("请输入账号和密码");
+    return;
+  }
+
+  if (password.length < 6) {
+    showToast("密码至少 6 位");
+    return;
+  }
+
+  if (submitter) {
+    submitter.disabled = true;
+    submitter.textContent = mode === "signup" ? "创建中..." : "登录中...";
+  }
+
+  try {
+    const email = accountToAuthEmail(account);
+    const result = mode === "signup"
+      ? await cloudState.client.auth.signUp({
+          email,
+          password,
+          options: {
+            data: {
+              account
+            }
+          }
+        })
+      : await cloudState.client.auth.signInWithPassword({
+          email,
+          password
+        });
+
+    if (result.error) throw result.error;
+
+    cloudState.user = result.data.user || result.data.session?.user || cloudState.user;
+    if (cloudState.user) {
+      const synced = await syncFromCloud("login", { render: false, toast: false });
+      render();
+      showToast(synced ? (mode === "signup" ? "账号已创建" : "登录成功") : "已登录，但同步失败");
+    } else {
+      render();
+      showToast("账号已创建，请确认后登录");
+    }
+  } catch (error) {
+    handleCloudError(error, mode === "signup" ? "创建账号失败" : "登录失败");
+    render();
+  }
+}
+
+async function handleCloudLogout() {
+  if (!cloudState.client) return;
+  window.clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = null;
+
+  try {
+    const { error } = await cloudState.client.auth.signOut();
+    if (error) throw error;
+    cloudState.user = null;
+    cloudState.status = "signed-out";
+    cloudState.message = "请登录";
+    render();
+    showToast("已退出登录");
+  } catch (error) {
+    handleCloudError(error, "退出失败");
+  }
+}
+
+function accountToAuthEmail(account) {
+  const text = cleanText(account).toLowerCase();
+  if (text.includes("@")) return text;
+
+  const slug = Array.from(text)
+    .map((char) => (/^[a-z0-9._-]$/.test(char) ? char : `u${char.codePointAt(0).toString(36)}`))
+    .join("")
+    .replace(/\.+/g, ".")
+    .slice(0, 64);
+
+  return `${slug || "user"}@combat.local`;
+}
+
+function getCloudUserLabel() {
+  if (!cloudState.user) return "未登录";
+  const account = cloudState.user.user_metadata?.account;
+  if (account) return account;
+  return String(cloudState.user.email || "").replace(/@combat\.local$/i, "") || "已登录";
+}
+
+function getStateTimestamp(candidate) {
+  const input = candidate && typeof candidate === "object" ? candidate : {};
+  const timestamps = [input.updatedAt]
+    .concat((input.projects || []).map((project) => project.updatedAt))
+    .concat((input.records || []).map((record) => record.updatedAt))
+    .map((value) => Date.parse(value))
+    .filter(Number.isFinite);
+
+  return timestamps.length ? Math.max(...timestamps) : 0;
+}
+
+function hasMeaningfulUserData(candidate) {
+  return getStateFingerprint(candidate) !== getStateFingerprint(createEmptyState());
+}
+
+function getStateFingerprint(candidate) {
+  const input = candidate && typeof candidate === "object" ? candidate : {};
+  return JSON.stringify({
+    projects: (input.projects || [])
+      .map((project) => ({
+        id: project.id,
+        name: project.name,
+        level1: project.level1,
+        level2: project.level2,
+        level3: project.level3,
+        task: project.task,
+        cadence: project.cadence,
+        completionCoefficient: Number(project.completionCoefficient),
+        enabled: project.enabled !== false,
+        showToday: project.showToday !== false,
+        rewards: project.rewards || {}
+      }))
+      .sort((a, b) => String(a.id).localeCompare(String(b.id))),
+    records: (input.records || [])
+      .map((record) => ({
+        projectId: record.projectId,
+        type: record.type,
+        date: record.date,
+        periodKey: record.periodKey,
+        rating: Number(record.rating)
+      }))
+      .sort((a, b) => `${a.projectId}:${a.periodKey}`.localeCompare(`${b.projectId}:${b.periodKey}`)),
+    settings: input.settings || {},
+    deletedProjectIds: (input.deletedProjectIds || []).slice().sort()
+  });
 }
 
 function render() {
   if (!refs.view) return;
+  if (shouldShowLogin()) {
+    refs.routeTitle.textContent = "登录";
+    refs.todayLabel.textContent = "云同步";
+    document.querySelector(".bottom-nav")?.classList.add("is-hidden");
+    refs.view.innerHTML = renderLogin();
+    return;
+  }
+
+  document.querySelector(".bottom-nav")?.classList.remove("is-hidden");
   refs.routeTitle.textContent = ROUTES[currentRoute] || "战斗力";
   refs.todayLabel.textContent = formatDateLabel(new Date());
 
@@ -446,6 +818,37 @@ function render() {
   };
 
   refs.view.innerHTML = (renderers[currentRoute] || renderDashboard)();
+}
+
+function renderLogin() {
+  const errorMarkup = cloudState.status === "error"
+    ? `<div class="sync-alert">${escapeHtml(cloudState.message)}</div>`
+    : "";
+
+  return `
+    <section class="auth-shell">
+      <div class="auth-panel">
+        <div class="weapon-mark auth-mark">⚔</div>
+        <p class="eyebrow">Cloud Sync</p>
+        <h2 class="auth-title">账号登录</h2>
+        <p class="auth-copy">同一个账号会同步项目、打星记录、等级和设置。</p>
+        ${errorMarkup}
+        <form id="loginForm" class="auth-form">
+          <label>账号
+            <input name="account" autocomplete="username" maxlength="80" required placeholder="输入账号或邮箱">
+          </label>
+          <label>密码
+            <input name="password" type="password" autocomplete="current-password" minlength="6" required placeholder="至少 6 位">
+          </label>
+          <div class="two-col">
+            <button class="primary-btn" type="submit" data-auth-mode="signin">登录</button>
+            <button class="ghost-btn" type="submit" data-auth-mode="signup">创建账号</button>
+          </div>
+        </form>
+        <p class="project-path auth-note">登录后会保持状态，之后打开页面会自动进入。</p>
+      </div>
+    </section>
+  `;
 }
 
 function renderDashboard() {
@@ -919,6 +1322,7 @@ function renderSettings() {
   const settings = state.settings;
   return `
     <form id="settingsForm" class="settings-grid">
+      ${renderCloudSettingsPanel()}
       <section class="settings-panel">
         <div class="card-header">
           <div>
@@ -1005,6 +1409,52 @@ function renderSettings() {
   `;
 }
 
+function renderCloudSettingsPanel() {
+  const statusClass = {
+    synced: "good",
+    syncing: "warn",
+    pending: "warn",
+    error: "off",
+    "signed-out": "off",
+    local: "neutral"
+  }[cloudState.status] || "neutral";
+  const lastSynced = cloudState.lastSyncedAt ? formatTimeLabel(cloudState.lastSyncedAt) : "未同步";
+
+  if (!cloudState.configured) {
+    return `
+      <section class="settings-panel">
+        <div class="card-header">
+          <div>
+            <h2 class="project-title">账号同步</h2>
+            <p class="project-path">本机保存 · 云同步未配置</p>
+          </div>
+          <span class="chip neutral">Local</span>
+        </div>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="settings-panel">
+      <div class="card-header">
+        <div>
+          <h2 class="project-title">账号同步</h2>
+          <p class="project-path">${escapeHtml(getCloudUserLabel())} · ${escapeHtml(cloudState.message)}</p>
+        </div>
+        <span class="chip ${statusClass}">${cloudState.status === "synced" ? "已同步" : "同步"}</span>
+      </div>
+      <div class="cloud-status-grid">
+        <div class="mini-stat"><b>${escapeHtml(lastSynced)}</b><span>最近同步</span></div>
+        <div class="mini-stat"><b>${state.records.length}</b><span>记录</span></div>
+      </div>
+      <div class="actions">
+        <button class="ghost-btn" type="button" data-action="manual-sync">立即同步</button>
+        <button class="danger-btn" type="button" data-action="logout">退出登录</button>
+      </div>
+    </section>
+  `;
+}
+
 function handleViewClick(event) {
   const button = event.target.closest("[data-action]");
   if (!button) return;
@@ -1023,6 +1473,8 @@ function handleViewClick(event) {
   if (action === "import-data") refs.importFile.click();
   if (action === "add-multiplier") addMultiplierRule();
   if (action === "delete-multiplier") deleteMultiplierRule(Number(index));
+  if (action === "manual-sync") syncFromCloud("manual", { render: true });
+  if (action === "logout") handleCloudLogout();
 }
 
 function getPresetFromDataset(dataset) {
@@ -1051,6 +1503,12 @@ function getCollapseKey(nodeKey, mode) {
 }
 
 function handleViewSubmit(event) {
+  if (event.target.id === "loginForm") {
+    event.preventDefault();
+    handleLoginSubmit(event);
+    return;
+  }
+
   if (event.target.id !== "settingsForm") return;
   event.preventDefault();
   saveSettingsFromForm(event.target);
@@ -1876,6 +2334,14 @@ function formatDateLabel(date) {
   return `${date.getMonth() + 1}月${date.getDate()}日 ${weekdays[date.getDay()]}`;
 }
 
+function formatTimeLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "未同步";
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${String(date.getHours()).padStart(2, "0")}:${String(
+    date.getMinutes()
+  ).padStart(2, "0")}`;
+}
+
 function formatDateShort(dateKey) {
   if (!validDateKey(dateKey)) return dateKey;
   const [, month, day] = dateKey.split("-");
@@ -1973,6 +2439,10 @@ globalThis.CombatPowerTest = {
   getScoreLinkedLevel,
   getQualityMultiplierForLevel,
   getLevelInfo,
+  accountToAuthEmail,
+  hasMeaningfulUserData,
+  getStateTimestamp,
+  getStateFingerprint,
   getISOWeekKey,
   DEFAULT_LEVEL_RULES
 };
