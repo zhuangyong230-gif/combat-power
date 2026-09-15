@@ -1,6 +1,7 @@
 const STORAGE_KEY = "combat-power-system:v1";
 const UI_STORAGE_KEY = "combat-power-ui:v1";
 const CLOUD_TABLE_NAME = "combat_profiles";
+const CLOUD_AUTH_STORAGE_KEY = "combat-power-auth";
 const CLOUD_SAVE_DELAY = 900;
 
 const ROUTES = {
@@ -68,6 +69,7 @@ const cloudState = {
   configured: false,
   client: null,
   user: null,
+  offlineMode: false,
   tableName: CLOUD_TABLE_NAME,
   status: "local",
   message: "本机保存",
@@ -484,7 +486,7 @@ async function initCloudSync() {
         autoRefreshToken: true,
         detectSessionInUrl: true,
         persistSession: true,
-        storageKey: "combat-power-auth"
+        storageKey: CLOUD_AUTH_STORAGE_KEY
       }
     });
 
@@ -492,6 +494,7 @@ async function initCloudSync() {
     if (error) throw error;
 
     cloudState.user = data.session?.user || null;
+    cloudState.offlineMode = false;
     cloudState.status = cloudState.user ? "syncing" : "signed-out";
     cloudState.message = cloudState.user ? "正在同步" : "请登录";
 
@@ -504,6 +507,7 @@ async function initCloudSync() {
       }
 
       if (event === "SIGNED_OUT") {
+        cloudState.offlineMode = false;
         cloudState.status = "signed-out";
         cloudState.message = "请登录";
         render();
@@ -514,7 +518,7 @@ async function initCloudSync() {
       await syncFromCloud("init", { render: false, toast: false });
     }
   } catch (error) {
-    handleCloudError(error, "登录状态读取失败");
+    handleAuthStateLoadError(error);
   }
 }
 
@@ -542,7 +546,7 @@ function cleanCloudConfigValue(value) {
 }
 
 function shouldShowLogin() {
-  return cloudState.configured && !cloudState.user;
+  return cloudState.configured && !cloudState.user && !cloudState.offlineMode;
 }
 
 function queueCloudSave() {
@@ -645,6 +649,37 @@ function handleCloudError(error, fallbackMessage) {
   if (refs.view) showToast(fallbackMessage);
 }
 
+function handleAuthStateLoadError(error) {
+  console.warn("Auth state recovery", error);
+  clearCloudAuthCache();
+  cloudState.user = null;
+  cloudState.offlineMode = false;
+  cloudState.status = "signed-out";
+  cloudState.message = "登录状态已过期，请重新登录";
+}
+
+function clearCloudAuthCache() {
+  if (typeof localStorage === "undefined") return;
+  localStorage.removeItem(CLOUD_AUTH_STORAGE_KEY);
+}
+
+function enterLocalMode() {
+  cloudState.user = null;
+  cloudState.offlineMode = true;
+  cloudState.status = "local";
+  cloudState.message = "本机临时使用，未同步";
+  render();
+  showToast("已进入本机模式");
+}
+
+function showCloudLogin() {
+  cloudState.user = null;
+  cloudState.offlineMode = false;
+  cloudState.status = "signed-out";
+  cloudState.message = "请登录";
+  render();
+}
+
 async function handleLoginSubmit(event) {
   const form = event.target;
   const mode = event.submitter?.dataset.authMode || "signin";
@@ -673,6 +708,7 @@ async function handleLoginSubmit(event) {
   }
 
   try {
+    cloudState.offlineMode = false;
     const email = accountToAuthEmail(account);
     const result = mode === "signup"
       ? await cloudState.client.auth.signUp({
@@ -712,15 +748,18 @@ async function handleCloudLogout() {
   cloudSaveTimer = null;
 
   try {
-    const { error } = await cloudState.client.auth.signOut();
+    const { error } = await cloudState.client.auth.signOut({ scope: "local" });
     if (error) throw error;
+  } catch (error) {
+    console.warn("Local sign out fallback", error);
+  } finally {
+    clearCloudAuthCache();
     cloudState.user = null;
+    cloudState.offlineMode = false;
     cloudState.status = "signed-out";
     cloudState.message = "请登录";
     render();
     showToast("已退出登录");
-  } catch (error) {
-    handleCloudError(error, "退出失败");
   }
 }
 
@@ -845,7 +884,8 @@ function renderLogin() {
             <button class="ghost-btn" type="submit" data-auth-mode="signup">创建账号</button>
           </div>
         </form>
-        <p class="project-path auth-note">登录后会保持状态，之后打开页面会自动进入。</p>
+        <button class="ghost-btn" type="button" data-action="enter-local-mode">暂时本机使用</button>
+        <p class="project-path auth-note">登录后会保持状态。云端临时不可用时，可以先本机记录，之后重新登录同步。</p>
       </div>
     </section>
   `;
@@ -1434,6 +1474,27 @@ function renderCloudSettingsPanel() {
     `;
   }
 
+  if (!cloudState.user) {
+    return `
+      <section class="settings-panel">
+        <div class="card-header">
+          <div>
+            <h2 class="project-title">账号同步</h2>
+            <p class="project-path">${escapeHtml(cloudState.message)} · 本机数据会继续保存</p>
+          </div>
+          <span class="chip neutral">Local</span>
+        </div>
+        <div class="cloud-status-grid">
+          <div class="mini-stat"><b>${state.records.length}</b><span>记录</span></div>
+          <div class="mini-stat"><b>${state.projects.length}</b><span>项目</span></div>
+        </div>
+        <div class="actions">
+          <button class="primary-btn" type="button" data-action="show-login">重新登录同步</button>
+        </div>
+      </section>
+    `;
+  }
+
   return `
     <section class="settings-panel">
       <div class="card-header">
@@ -1475,6 +1536,8 @@ function handleViewClick(event) {
   if (action === "delete-multiplier") deleteMultiplierRule(Number(index));
   if (action === "manual-sync") syncFromCloud("manual", { render: true });
   if (action === "logout") handleCloudLogout();
+  if (action === "enter-local-mode") enterLocalMode();
+  if (action === "show-login") showCloudLogin();
 }
 
 function getPresetFromDataset(dataset) {
