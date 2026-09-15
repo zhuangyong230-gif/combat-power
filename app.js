@@ -1,5 +1,6 @@
 const STORAGE_KEY = "combat-power-system:v1";
 const UI_STORAGE_KEY = "combat-power-ui:v1";
+const APP_VERSION = "20260915-v15";
 const CLOUD_TABLE_NAME = "combat_profiles";
 const CLOUD_AUTH_STORAGE_KEY = "combat-power-auth";
 const CLOUD_SAVE_DELAY = 900;
@@ -2446,7 +2447,21 @@ function showToast(message) {
 
 function registerServiceWorker() {
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("sw.js").catch((error) => console.info("Service worker skipped", error));
+    navigator.serviceWorker
+      .register(`sw.js?v=${APP_VERSION}`)
+      .then((registration) => {
+        if (registration.waiting) registration.waiting.postMessage({ type: "SKIP_WAITING" });
+        registration.addEventListener("updatefound", () => {
+          const worker = registration.installing;
+          if (!worker) return;
+          worker.addEventListener("statechange", () => {
+            if (worker.state === "installed" && navigator.serviceWorker.controller) {
+              window.location.reload();
+            }
+          });
+        });
+      })
+      .catch((error) => console.info("Service worker skipped", error));
   }
 }
 
